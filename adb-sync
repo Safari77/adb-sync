@@ -23,6 +23,7 @@ import os
 import re
 import stat
 import subprocess
+from datetime import datetime
 import time
 from types import TracebackType
 from typing import Callable, cast, Dict, List, IO, Iterable, Optional, Tuple, Type
@@ -131,30 +132,33 @@ class AdbFileSystem(GlobLike, OSLike):
                              (?P<st_mtime>
                                [0-9]{4}-[0-9]{2}-[0-9]{2}     # Date.
                                [ ]
-                               [0-9]{2}:[0-9]{2})             # Time.
+                               [0-9]{2}:[0-9]{2}:[0-9]{2}.[0-9]{9}) # Time with nanosecond accuracy.
                              [ ]
+                             (?P<tz>
+                               [+-][0-9]{4})                  # Timezone.
+                               [ ]
                              # Don't capture filename for symlinks (ambiguous).
                              (?(S_IFLNK) .* | (?P<filename> .*))
                              $""", re.DOTALL | re.VERBOSE)
 
   def LsToStat(self, line: bytes) -> Tuple[os.stat_result, bytes]:
-    """Convert a line from 'ls -l' output to a stat result.
+    """Convert a line from 'ls -ll' output to a stat result.
 
     Args:
-      line: Output line of 'ls -l' on Android.
+      line: Output line of 'ls -ll' on Android.
 
     Returns:
       os.stat_result for the line.
 
     Raises:
-      OSError: if the given string is not a 'ls -l' output line (but maybe an
+      OSError: if the given string is not a 'ls -ll' output line (but maybe an
       error message instead).
     """
 
     match = self.LS_TO_STAT_RE.match(line)
     if match is None:
       logging.error('Could not parse %r.', line)
-      raise OSError('Unparseable ls -al result.')
+      raise OSError('Unparseable ls -all result.')
     groups = match.groupdict()
 
     # Get the values we're interested in.
@@ -176,10 +180,13 @@ class AdbFileSystem(GlobLike, OSLike):
     if groups['S_IFSOCK']:
       st_mode |= stat.S_IFSOCK
     st_size = None if groups['st_size'] is None else int(groups['st_size'])
-    st_mtime = int(
-        time.mktime(
-            time.strptime(
-                match.group('st_mtime').decode('ascii'), '%Y-%m-%d %H:%M')))
+    strp = datetime.strptime(match.group('st_mtime').decode('ascii')[:-3] +
+           " " + groups['tz'].decode('ascii'), '%Y-%m-%d %H:%M:%S.%f %z')
+    # Microsecond accuracy
+    st_mtime = strp.timestamp()
+
+    #logging.info('Parsing %r', line)
+    #logging.info('st_size=%r, st_mtime=%r, tz=%r', st_size, st_mtime, groups['tz'].decode('ascii'))
 
     # Fill the rest with dummy values.
     st_ino = 1
@@ -231,7 +238,7 @@ class AdbFileSystem(GlobLike, OSLike):
     """List the contents of a directory, caching them for later lstat calls."""
     with Stdout(self.adb +
                 [b'shell',
-                 b'ls -al %s' % (self.QuoteArgument(path + b'/'),)]) as stdout:
+                 b'ls -all %s' % (self.QuoteArgument(path + b'/'),)]) as stdout:
       for line in stdout:
         if line.startswith(b'total '):
           continue
@@ -252,7 +259,7 @@ class AdbFileSystem(GlobLike, OSLike):
       return self.stat_cache[path]
     with Stdout(
         self.adb +
-        [b'shell', b'ls -ald %s' % (self.QuoteArgument(path),)]) as stdout:
+        [b'shell', b'ls -alld %s' % (self.QuoteArgument(path),)]) as stdout:
       for line in stdout:
         if line.startswith(b'total '):
           continue
@@ -269,7 +276,7 @@ class AdbFileSystem(GlobLike, OSLike):
       return self.stat_cache[path]
     with Stdout(
         self.adb +
-        [b'shell', b'ls -aldL %s' % (self.QuoteArgument(path),)]) as stdout:
+        [b'shell', b'ls -alldL %s' % (self.QuoteArgument(path),)]) as stdout:
       for line in stdout:
         if line.startswith(b'total '):
           continue
@@ -304,14 +311,14 @@ class AdbFileSystem(GlobLike, OSLike):
     """Set the time of a file to a specified unix time."""
     atime, mtime = times
     timestr = time.strftime('%Y%m%d.%H%M%S',
-                            time.localtime(mtime)).encode('ascii')
+                                time.localtime(mtime)).encode('ascii')
     if subprocess.call(
         self.adb +
         [b'shell',
          b'touch -mt %s %s' % (timestr, self.QuoteArgument(path))]) != 0:
       raise OSError('touch failed')
     timestr = time.strftime('%Y%m%d.%H%M%S',
-                            time.localtime(atime)).encode('ascii')
+                                time.localtime(atime)).encode('ascii')
     if subprocess.call(
         self.adb +
         [b'shell',
@@ -486,7 +493,7 @@ class FileSyncer(object):
     self.copy_links = copy_links
     self.dry_run = dry_run
     self.num_bytes = 0
-    self.start_time = time.time()
+    self.start_time = time.time_ns()
 
   # Attributes filled in later.
   local_only = None  # type: List[Tuple[bytes, os.stat_result]]
@@ -565,13 +572,10 @@ class FileSyncer(object):
       l2r = self.local_to_remote
       r2l = self.remote_to_local
       if l2r and r2l:
-        # Truncate times to full minutes, as Android's "ls" only outputs minute
-        # accuracy.
-        localminute = int(localstat.st_mtime / 60)
-        remoteminute = int(remotestat.st_mtime / 60)
-        if localminute > remoteminute:
+        # Times in microseconds
+        if localstat.st_mtime > remotestat.st_mtime:
           r2l = False
-        elif localminute < remoteminute:
+        elif localstat.st_mtime < remotestat.st_mtime:
           l2r = False
       if l2r and r2l:
         logging.warning('Unresolvable: %r', name)
@@ -650,11 +654,11 @@ class FileSyncer(object):
     if self.dry_run:
       logging.info('Total: %d bytes', self.num_bytes)
     else:
-      end_time = time.time()
+      end_time = time.time_ns()
       dt = end_time - self.start_time
-      rate = self.num_bytes / 1024.0 / dt
-      logging.info('Total: %d KB/s (%d bytes in %.3fs)', rate, self.num_bytes,
-                   dt)
+      rate = self.num_bytes / 1048576.0 / (dt / 1e9)
+      logging.info('Total: %d MiB/s (%d bytes in %.3fs)', rate,
+                   self.num_bytes, dt / 1e9)
 
 
 def ExpandWildcards(globber: GlobLike, path: bytes) -> Iterable[bytes]:
