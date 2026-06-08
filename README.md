@@ -8,7 +8,7 @@ DEPRECATED
 ==========
 
 This project is no longer being maintained; please use
-[better-adb-sync](https://github.com/SelfAdjointOperator/better-adb-sync)
+[better-adb-sync](https://github.com/jpstotz/better-adb-sync)
 instead. Thanks!
 
 Related Projects
