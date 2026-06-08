@@ -23,10 +23,26 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from datetime import datetime
 import time
 from types import TracebackType
 from typing import Callable, cast, Dict, List, IO, Iterable, Optional, Tuple, Type
+
+
+def DisplayPath(path: bytes) -> str:
+  """Decode a bytes path into a human-readable string for log messages.
+
+  Paths are handled as raw bytes everywhere else in this script because POSIX
+  and Android filenames are arbitrary byte strings that need not be valid in
+  any particular encoding. For logging, however, we want readable text rather
+  than a bytes repr such as b'File\\xe2\\x80\\x942025.epub'. We decode using
+  the filesystem encoding and only fall back to a backslash escape for bytes
+  that are not valid in that encoding, so a multi-byte UTF-8 codepoint is
+  decoded whole and never split into its individual bytes.
+  """
+  encoding = sys.getfilesystemencoding() or 'utf-8'
+  return path.decode(encoding, errors='backslashreplace')
 
 
 class OSLike(object):
@@ -157,7 +173,7 @@ class AdbFileSystem(GlobLike, OSLike):
 
     match = self.LS_TO_STAT_RE.match(line)
     if match is None:
-      logging.error('Could not parse %r.', line)
+      logging.error('Could not parse %s.', DisplayPath(line))
       raise OSError('Unparseable ls -all result.')
     groups = match.groupdict()
 
@@ -248,7 +264,7 @@ class AdbFileSystem(GlobLike, OSLike):
         except OSError:
           continue
         if filename is None:
-          logging.error('Could not parse %r.', line)
+          logging.error('Could not parse %s.', DisplayPath(line))
         else:
           self.stat_cache[path + b'/' + filename] = statdata
           yield filename
@@ -382,7 +398,7 @@ def BuildFileList(fs: OSLike, path: bytes, follow_links: bool,
   elif stat.S_ISLNK(statresult.st_mode) and not follow_links:
     yield prefix, statresult
   else:
-    logging.info('Unsupported file: %r.', path)
+    logging.info('Unsupported file: %s.', DisplayPath(path))
 
 
 def DiffLists(a: Iterable[Tuple[bytes, os.stat_result]],
@@ -466,8 +482,8 @@ class DeleteInterruptedFile(object):
                exc_val: Optional[Exception],
                exc_tb: Optional[TracebackType]) -> bool:
     if exc_type is not None:
-      logging.info('Interrupted-%s-Delete: %r',
-                   'Pull' if self.fs == os else 'Push', self.name)
+      logging.info('Interrupted-%s-Delete: %s',
+                   'Pull' if self.fs == os else 'Push', DisplayPath(self.name))
       if not self.dry_run:
         self.fs.unlink(self.name)
     return False
@@ -544,7 +560,7 @@ class FileSyncer(object):
         else:
           for name, s in reversed(self.dst_only[i]):
             dst_name = self.dst[i] + name
-            logging.info('%s-Delete: %r', self.push[i], dst_name)
+            logging.info('%s-Delete: %s', self.push[i], DisplayPath(dst_name))
             if stat.S_ISDIR(s.st_mode):
               if not self.dry_run:
                 self.dst_fs[i].rmdir(dst_name)
@@ -578,7 +594,7 @@ class FileSyncer(object):
         elif localstat.st_mtime < remotestat.st_mtime:
           l2r = False
       if l2r and r2l:
-        logging.warning('Unresolvable: %r', name)
+        logging.warning('Unresolvable: %s', DisplayPath(name))
         continue
       if l2r:
         i = 0  # Local to remote operation.
@@ -589,7 +605,8 @@ class FileSyncer(object):
         src_stat = remotestat
         dst_stat = localstat
       dst_name = self.dst[i] + name
-      logging.info('%s-Delete-Conflicting: %r', self.push[i], dst_name)
+      logging.info('%s-Delete-Conflicting: %s', self.push[i],
+                   DisplayPath(dst_name))
       if stat.S_ISDIR(localstat.st_mode) or stat.S_ISDIR(remotestat.st_mode):
         if not self.allow_replace:
           logging.info('Would have to replace to do this. '
@@ -632,7 +649,7 @@ class FileSyncer(object):
         for name, s in self.src_only[i]:
           src_name = self.src[i] + name
           dst_name = self.dst[i] + name
-          logging.info('%s: %r', self.push[i], dst_name)
+          logging.info('%s: %s', self.push[i], DisplayPath(dst_name))
           if stat.S_ISDIR(s.st_mode):
             if not self.dry_run:
               self.dst_fs[i].makedirs(dst_name)
@@ -867,7 +884,8 @@ def main() -> None:
       return
 
   for i in range(len(localpaths)):
-    logging.info('Sync: local %r, remote %r', localpaths[i], remotepaths[i])
+    logging.info('Sync: local %s, remote %s', DisplayPath(localpaths[i]),
+                 DisplayPath(remotepaths[i]))
     syncer = FileSyncer(adb, localpaths[i], remotepaths[i], local_to_remote,
                         remote_to_local, preserve_times, delete_missing,
                         allow_overwrite, allow_replace, copy_links, dry_run)
